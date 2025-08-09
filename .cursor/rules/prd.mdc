@@ -1,0 +1,324 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Title & One-Line Summary
+**Video → Recipe** — Paste a cooking video (file or URL) and get a clean, structured recipe (Title, Description, Yield/Servings, Total/Active Time, Ingredients with normalized units, Equipment, and Step-by-step Instructions) with exports to Markdown, TXT, and JSON.
+
+# Goals and Non-Goals
+**Goals**
+- Turn one cooking video into a high-quality, normalized recipe with dual US+Metric units.
+- Support uploads and URLs; process up to 60 min, 1080p, ≤ 1.5 GB.
+- Always emit schema-valid JSON plus human-friendly Markdown/TXT.
+- E2E latency ≤ 4 min for a 5-min 1080p video (p95 ≤ 6 min).
+- Persist 30-day history with re-downloads; hard delete on request.
+- Collect feedback and capture user edits (diffs).
+
+**Non-Goals (Post-MVP)**
+- In-app video editing or multi-video blending.
+- Nutrition facts.
+- Mandatory auth for public beta.
+- On-device/offline processing.
+
+# Personas & Key Use Cases
+- **Beginner home cook:** Turn TikTok/YouTube into printable steps.
+- **Meal prepper:** Needs consistent units and yields.
+- **Food blogger/Dev:** Needs clean JSON for CMS import.
+- **Internal QA:** Verify quality and regressions.
+
+**Use Cases**
+- Paste a public URL and export Markdown/TXT/JSON.
+- Upload a phone .mp4 and copy ingredients to notes.
+- Revisit history; give thumbs up/down or suggest edits.
+
+# User Stories / JTBD
+- When I paste a URL, give me a consistent, normalized recipe so I don’t rewatch.
+- When I upload a clip, give me imperative steps with time hints.
+- When I find errors, let me correct and export the fixed result quickly.
+
+# End-to-End Flows
+**Happy Path**
+1) Upload/URL → client validates → multipart S3 upload or server fetch (progress).
+2) Start job → SSE stream: Queued → Extracting → Transcribing → Understanding → Synthesizing → Validating → Ready.
+3) Processing: FFmpeg `loudnorm` → Whisper transcription → parse dish/ingredients/equipment/times → LLM function-call to JSON → validate → dual-unit render.
+4) Deliver: Show formatted recipe; copy/download JSON/MD/TXT; store to history.
+5) Feedback: Thumbs + optional comments; “Suggest Edit” stores diff.
+
+**Errors/Retry**
+- Upload fail: actionable message; resumable multipart.
+- URL 403/geo-block: ask to upload file instead.
+- ASR low confidence (<0.4 median): warn and request confirm of key ingredients.
+- LLM schema invalid: auto-repair (≤2 retries, lower temp); on failure return 500 with trace_id + retry.
+- Worker crash: backoff 1→4→9 min (max 3).
+
+# Functional Requirements
+## Upload/Intake
+- **Formats:** .mp4, .mov, .mkv, .webm; ≤ 1.5 GB; ≤ 60 min; up to 4K (downsample to 1080p for processing); ≥ 10 s.
+- **Sources:** YouTube, Vimeo, public MP4/MOV (no DRM/private).
+- **Progress:** Shows bytes/ETA; updates ≥ 2 Hz; resumes within 5 min.
+- **AC:** 415 for unsupported; 413 for oversized; progress visible ≤ 500 ms after start.
+
+## Video Processing
+- FFmpeg extracts mono 16 kHz PCM WAV; apply `loudnorm` to −23 LUFS; create 1080p@30fps proxy if needed.
+- **AC:** Audio peak clipping < 1%; 5-min 1080p proxy+audio in ≤ 25 s on standard worker.
+
+## Transcription
+- Whisper-1 API or WhisperX (word timestamps). Auto language detect (record ISO 639-1).
+- Outputs: text + segments (start/end/confidence or logprob proxy).
+- **AC:** WER ≤ 15% (clear narration); language detect ≥ 95%; no timestamp gaps > 10 s unless silence.
+
+## Content Understanding
+- Extract dish, ingredients (quantity, unit, item, prep), equipment, total/active times, yield. Handle music/jump cuts; ASMR falls back to overlays (vision OCR Post-MVP).
+- **AC:** Ingredient coverage ≥ 90% clear, ≥ 70% noisy; times present in ≥ 95% clear cases.
+
+## Recipe Synthesis
+- Numbered, imperative steps; ≤ 240 chars/step; sub-steps allowed; include step time hints and servings.
+- **AC:** 100% schema-valid; ≥ 95% steps start with an imperative verb.
+
+## Ingredient Normalization
+- Synonyms (e.g., scallion=green onion); internal base g/mL; render dual US+Metric.
+- Merge duplicates; sum quantities; keep prep note. Infer allergens: gluten, nuts, dairy, shellfish, eggs, soy, fish, sesame; use "none" if none.
+- **AC:** Units limited to {g, kg, mL, L, tsp, Tbsp, cup, oz, lb}; allergen precision/recall ≥ 95%.
+
+## Output Formats
+- JSON (strict schema), Markdown (.md), TXT (.txt); copy and download.
+- **AC:** JSON validates with Zod/Pydantic; Markdown has headings: Title, Description, Yield, Time, Ingredients, Equipment, Instructions, Notes, Allergens.
+
+## History & Persistence
+- Last 50 jobs per anonymous browser (cookie) or per user (when auth exists).
+- Retain 30 days; hard delete within 24 h.
+- **AC:** Re-download all formats; deleted assets return 404 and are removed from object storage.
+
+## Feedback Loop
+- Thumbs up/down + optional text; “Suggest Edit” with schema re-validate.
+- **AC:** Store feedback with timestamp/job_id/user_id?; edits must validate before save.
+
+## Internationalization
+- **MVP:** English input/output. **Post-MVP:** Multi-language output (ES/FR/DE/HI/JA) and locale units.
+
+# Non-Functional Requirements
+| Area | Target |
+|---|---|
+| Latency | ≤ 4 min E2E for 5-min clip (p95 ≤ 6) |
+| Availability | 99.5% monthly SLO |
+| Success Rate | ≥ 98% jobs without manual retry |
+| Retries | Exponential 1/4/9 min, max 3 |
+| Cost | ≤ $0.20 per 10-min video (see Cost) |
+| Privacy | No training on user data by default (opt-in only) |
+| Security | Signed URLs; least-privilege IAM; SSE-S3/AES-256 |
+| Accessibility | WCAG 2.1 AA; full keyboard/ARIA; ≥ 4.5:1 contrast |
+| Observability | Structured logs/traces/metrics; PII redaction |
+
+# Tech Stack (STRICT)
+- **Frontend:** Next.js 14 + TS + Tailwind + shadcn/ui; UploadThing or S3 multipart; React Query; Zod.
+- **Backend (choose A/B):** A) FastAPI + Uvicorn; Pydantic v2; Celery; Redis. B) Express + TS; BullMQ; Redis.
+- **Media:** FFmpeg server-side with `loudnorm`.
+- **Transcription:** Whisper-1 API or WhisperX (timestamps).
+- **LLM:** GPT-4o or GPT-5 with JSON function calling; temperature ≤ 0.3.
+- **Validation:** Pydantic (A) or Zod (B).
+- **Storage:** Postgres (Supabase/RDS) + S3-compatible object storage.
+- **Auth (Post-MVP):** Clerk or NextAuth.
+- **Telemetry:** PostHog + OpenTelemetry.
+- **Deploy:** Frontend on Vercel; API/workers on Fly/Railway/AWS; optional GPU on Modal/Runpod.
+- **Secrets:** `.env` 12-factor.
+
+**Alternatives & Switch**
+- UploadThing ↔ direct S3 multipart (switch when concurrent uploads > 200).
+- Whisper API ↔ WhisperX (cost, privacy, or throughput).
+- Redis ↔ RabbitMQ (durability/delayed jobs).
+- Supabase ↔ RDS (VPC/compliance).
+- Fly/Railway ↔ AWS ECS/EKS (regional control).
+
+# Data Model
+- **Conventions:** UUID v4 ids; UTC ISO 8601 `created_at`/`updated_at`; soft delete `deleted_at`.
+- **users:** id PK; email UNIQUE NULL; auth_provider; created_at. Idx: email.
+- **uploads:** id PK; user_id FK; source_type ('file'|'url'); source_url; object_key; filename; size_bytes; duration_sec; status ('pending'|'uploaded'|'failed'); created_at. Idx: user_id, created_at.
+- **jobs:** id PK; upload_id FK; state ('queued'|'extracting'|'transcribing'|'understanding'|'synthesizing'|'validating'|'completed'|'failed'); error_code/message; metrics JSONB; created_at; updated_at. Idx: upload_id, state.
+- **transcripts:** id PK; job_id FK; language; segments JSONB; text; created_at. Idx: job_id.
+- **recipes:** id PK; job_id FK; json JSONB; markdown TEXT; txt TEXT; created_at. Idx: job_id.
+- **feedback:** id PK; job_id FK; type ('thumbs_up'|'thumbs_down'|'edit'); comments; diff_json JSONB; created_at. Idx: job_id.
+
+# API Design
+**Auth:** None (MVP). **Rate limit:** 60 req/min per IP.
+
+- **POST `/api/create-upload`** → returns S3 form fields.  
+  **Req** `{"filename":"shrimp.mp4","size_bytes":734003200,"source_type":"file"}`  
+  **Res** `{"upload_id":"<uuid>","s3_fields":{"url":"...","fields":{"key":"uploads/<uuid>","policy":"..."}}}`  
+  **Errors:** 400 invalid; 413 too large; 415 unsupported.
+
+- **POST `/api/start-job`**  
+  **Req** `{"upload_id":"<uuid>"}`  
+  **Res** `{"job_id":"<uuid>","sse_url":"/api/jobs/<uuid>/events"}`
+
+- **GET `/api/jobs/{job_id}/status`** → `{"job_id":"<uuid>","state":"synthesizing","progress":{"pct":72}}`
+
+- **GET `/api/get-recipe?job_id=...`** → `{"recipe_json":{...},"markdown":"# ...","txt":"..."}`  
+  **Errors:** 425 not ready; 404 missing.
+
+- **GET `/api/list-history?cursor=...&limit=20`** → `{"items":[{"job_id":"...","created_at":"2025-08-08T20:13:03Z","title":"..."}],"next_cursor":null}`
+
+- **POST `/api/submit-feedback`** → `{"ok":true}`  
+  **Req** `{"job_id":"<uuid>","type":"thumbs_down","comments":"...","diff_json":null}`
+
+- **DELETE `/api/delete-assets`** → `{"status":"scheduled"}`  
+  **Req** `{"job_id":"<uuid>","hard_delete":true}`
+
+**Webhooks (completion)**  
+`{"event":"job.completed","job_id":"<uuid>","timestamp":"2025-08-08T20:13:03Z","title":"...","download_urls":{"json":"...","md":"...","txt":"..."}}`
+
+**SSE** `GET /api/jobs/{job_id}/events` → events: queued/extracting/transcribing/understanding/synthesizing/validating/completed/failed.
+
+**Standard Error Body**  
+`{"error":"unsupported_media_type","message":"Only mp4, mov, mkv, webm allowed.","hint":"Convert to MP4 (H.264 + AAC)."}` 
+
+# Prompting & JSON Schemas
+**System Prompt (concise):**  
+“You are a professional recipe writer. Convert cooking narration and cues into a structured recipe. Use imperative, numbered steps; precise times; normalized ingredients (merge duplicates); infer allergens. Output only via the provided JSON schema with dual US+Metric units.”
+
+**Developer Prompt**
+- Temp 0.2 (retry 0.1 on schema errors). Max 240 chars/step; `time_hint` like "3–4 min"/"overnight".
+- Infer servings if absent (2 small dishes; 4 pasta).
+- Allergen rules: gluten, nuts, dairy, shellfish, eggs, soy, fish, sesame; else "none".
+- Prefer “scallions” over “spring onions” unless explicit.
+- Return valid JSON only.
+
+**User Message Template**
+{"transcript_text":"<full transcript>","segments":[{"start":0.0,"end":4.2,"text":"..."}],"language":"en","video_metadata":{"duration_sec":300,"fps":30,"height":1080,"width":1920},"hints":{"overlay_text":["GARLIC BUTTER SHRIMP"],"detected_items":["shrimp","garlic","butter","lemon","pasta"]}}
+
+**Recipe JSON Schema (strict)**
+{
+  "title": "Recipe",
+  "type": "object",
+  "required": ["title", "servings", "time", "ingredients", "equipment", "steps", "notes", "allergens"],
+  "properties": {
+    "title": {"type": "string"},
+    "servings": {"type": "integer", "minimum": 1},
+    "time": {"type": "object", "required": ["total", "active"], "properties": {"total": {"type": "string"}, "active": {"type": "string"}}},
+    "ingredients": {"type": "array", "items": {"type": "object", "required": ["quantity", "unit", "item"], "properties": {"quantity": {"type": "number"}, "unit": {"type": "string"}, "item": {"type": "string"}, "prep": {"type": "string"}, "alternates": {"type": "array", "items": {"type": "string"}}}}},
+    "equipment": {"type": "array", "items": {"type": "string"}},
+    "steps": {"type": "array", "items": {"type": "object", "required": ["n", "text"], "properties": {"n": {"type": "integer", "minimum": 1}, "text": {"type": "string"}, "time_hint": {"type": "string"}}}},
+    "notes": {"type": "array", "items": {"type": "string"}},
+    "allergens": {"type": "array", "items": {"type": "string", "enum": ["gluten", "nuts", "dairy", "eggs", "shellfish", "soy", "fish", "sesame", "none"]}}
+  }
+}
+
+**Unit Normalization Policy**
+- Internal: grams (g), milliliters (mL). Render dual units.
+- US→Metric: 1 tsp=5 mL; 1 Tbsp=15 mL; 1 cup=240 mL; 1 oz=28 g; 1 lb=454 g.
+- Metric→US: round to nearest practical fraction (¼, ½, ¾ tsp/Tbsp; ⅓, ½, ⅔ cup).
+- Counted items keep count + approx metric (e.g., “2 cloves (≈6 g)”).
+
+**Verb & Numbering**
+- Imperatives: Heat, Add, Stir, Simmer…
+- Steps 1..N; sub-steps (a), (b) only if needed.
+- Time hints like "5 min", "10–12 min", "overnight".
+
+# Acceptance Criteria & Test Plan
+**Automated**
+- 100% JSON schema-valid; unit whitelist enforced; allergens ⊆ enum; imperative-first steps ≥ 95%.
+
+**Manual QA**
+1) Paste sample URL; verify status transitions and final render.  
+2) Dual units on ≥ 90% ingredients.  
+3) Yield + time fields present and reasonable.  
+4) Export JSON/MD/TXT and open cleanly.
+
+**Scenario Tests**
+- Clear narration (5-min pasta): coverage ≥ 90%, coherency ≥ 4/5, ≤ 4 min E2E.
+- Noisy music: coverage ≥ 70%, low-confidence banner, times present.
+- ASMR/timelapse (no speech): parse overlays; if none, mark inferred + user confirm prompt.
+- Multi-language (ES): detect language; English output; unit policy applied.
+- Off-topic/brands: ignore unless essential (e.g., “Kewpie mayo”).
+
+# Edge Cases & Error Handling
+- 415 unsupported: “Allowed: mp4, mov, mkv, webm.”
+- 413 oversized: “Max 1.5 GB or 60 min.”
+- Silent audio: “Low audio; we’ll infer from overlays if present.”
+- Heavy accent/low confidence: banner + confirm ingredients.
+- Multiple dishes: select primary by frequency/time; let user change.
+- Geo-blocked: suggest upload.
+- Validation fail: auto-repair; else actionable 500 with trace_id.
+
+# Performance, Scaling & Cost
+**Workers**
+- CPU: 2 video pipelines/worker; 4 transcription tasks if API-hosted.
+- GPU: 1 pipeline if WhisperX.
+- Queue cap: 100 jobs/region; return 429 with Retry-After when saturated.
+
+**ROM Cost per 10-min 1080p**
+| Component | Assumption | Cost |
+|---|---|---|
+| S3 storage | 1.5 GB ingress + 3 downloads | $0.01 |
+| Egress | webhook/exports | $0.005 |
+| Transcription | Whisper API ≈ $0.006/min | $0.06 |
+| LLM | ~4k in + 1.5k out tokens | $0.02 |
+| Misc | FFmpeg/DB | $0.005 |
+| **Total** |  | **~$0.095** |
+
+**Levers:** Switch to WhisperX; cache synonyms/units; pre-LLM structure to shrink prompt.
+
+# Security, Compliance & Data Retention
+- Signed URLs; objects private; SSE-S3; least-privilege IAM.
+- Logs redact PII; no transcript text in error logs.
+- Default retention 30 days; hard delete within 24 h across S3/DB/cache.
+- No training on user data without opt-in.
+- Audit log for deletes (who/when/job_id); webhook HMAC + nonce + timestamp ±5 min; CORS locked to app origin.
+
+# Cursor Project Setup
+**Repo**
+```
+/app     # Next.js frontend
+/api     # FastAPI (A) or Express (B)
+/workers # Celery (A) or BullMQ (B)
+/infra   # IaC, FFmpeg configs
+/schemas # JSON Schema, models
+```
+
+**Bootstrap (A: FastAPI+Celery)**
+```
+pnpm dlx create-next-app@latest video-to-recipe --ts --eslint --app
+mkdir -p api workers schemas
+pip install fastapi uvicorn[standard] pydantic celery redis boto3 psycopg[binary] sqlalchemy opentelemetry-sdk posthog ffmpeg-python
+```
+
+**Bootstrap (B: Express+BullMQ)**
+```
+pnpm add express zod bullmq ioredis multer aws-sdk @opentelemetry/api posthog-node
+```
+
+**.env.example**
+```
+OPENAI_API_KEY=
+WHISPER_MODE=api
+DATABASE_URL=postgres://user:pass@host:5432/recipes
+S3_ENDPOINT=https://s3.amazonaws.com
+S3_BUCKET=video-to-recipe
+S3_REGION=us-east-1
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+REDIS_URL=redis://:<password>@host:6379/0
+POSTHOG_API_KEY=
+WEBHOOK_SECRET=
+JWT_SECRET=
+```
+
+**CI (GitHub Actions)**
+- lint, typecheck, schema-validate, e2e-sample (mocked ASR), FFmpeg smoke test.
+
+# Milestones & Risks
+**1-Week MVP**
+- Day 1: Repo + upload UI + S3 multipart; DB migrations; `/create-upload`, `/start-job`.
+- Day 2: FFmpeg extraction + `loudnorm`; proxy; state machine; SSE.
+- Day 3: Whisper API; persist transcript; basic parser.
+- Day 4: LLM function-call; schema validate; MD/TXT renderers.
+- Day 5: History; downloads; feedback; delete.
+- Day 6: QA scenarios; accessibility; telemetry.
+- Day 7: CI; profiling; docs.
+
+**Risks/Mitigations**
+- GPU/ASR limits → fallback to Whisper API; queue backpressure.
+- Noisy audio → `loudnorm`, low-confidence warnings; OCR Post-MVP.
+- Schema drift → strict JSON schema; low temp; auto-repair; contract tests.
+- Cost spikes → token budget, pre-LLM structuring, self-host ASR at scale.
+- URL ingestion failures → clear upload remediation; multi-region fetchers.
