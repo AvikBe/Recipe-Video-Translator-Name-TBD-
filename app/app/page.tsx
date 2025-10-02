@@ -1,5 +1,8 @@
 "use client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTheme } from "./contexts/ThemeContext";
+import Header from "./components/Header";
+import { PaperAirplaneIcon, PaperclipIcon, DownloadIcon } from "./components/Icons";
 
 type JobState =
   | "idle"
@@ -26,6 +29,7 @@ type Recipe = {
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000";
 
 export default function Home() {
+  const { isDark, toggleTheme } = useTheme();
   const [videoUrl, setVideoUrl] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -46,6 +50,10 @@ export default function Home() {
     return (videoUrl && videoUrl.trim().length > 0) || !!file;
   }, [videoUrl, file]);
 
+  type CreateUploadPayload =
+    | { filename: string; size_bytes: number; source_type: "file" }
+    | { filename: string; size_bytes: number; source_type: "url"; source_url: string };
+
   const handleSubmit = useCallback(async () => {
     setRecipe(null);
     setMarkdown("");
@@ -53,12 +61,18 @@ export default function Home() {
     setEvents([]);
     setState("queued");
 
-    const payload: any = {
-      filename: file?.name ?? "url.mp4",
-      size_bytes: file?.size ?? 0,
-      source_type: videoUrl ? "url" : "file",
-      ...(videoUrl ? { source_url: videoUrl } : {}),
-    };
+    const payload: CreateUploadPayload = videoUrl
+      ? {
+          filename: "url.mp4",
+          size_bytes: 0,
+          source_type: "url",
+          source_url: videoUrl,
+        }
+      : {
+          filename: file?.name ?? "file.mp4",
+          size_bytes: file?.size ?? 0,
+          source_type: "file",
+        };
     try {
       const cu = await fetch(`${API_BASE}/api/create-upload`, {
         method: "POST",
@@ -78,9 +92,10 @@ export default function Home() {
 
       const es = new EventSource(`${API_BASE}${sse_url}`);
       esRef.current = es;
-      const onAny = (evt: MessageEvent) => {
+      const onAny: EventListener = (evt) => {
+        const me = evt as MessageEvent;
         try {
-          const data = JSON.parse(evt.data);
+          const data = JSON.parse(String(me.data));
           if (data.state) setState(data.state as JobState);
         } catch {}
         setEvents((prev) => [...prev, `${evt.type}`]);
@@ -95,7 +110,7 @@ export default function Home() {
         "completed",
         "failed",
         "message",
-      ].forEach((t) => es.addEventListener(t, onAny as any));
+      ].forEach((t) => es.addEventListener(t, onAny));
       es.onerror = () => {
         // ignore transient errors during SSE
       };
@@ -134,7 +149,7 @@ export default function Home() {
       console.error(err);
       setState("failed");
     }
-  }, [API_BASE, file, videoUrl]);
+  }, [file, videoUrl]);
 
   const download = useCallback((content: string, filename: string, type: string) => {
     const blob = new Blob([content], { type });
@@ -146,82 +161,207 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }, []);
 
-  return (
-    <div className="min-h-screen p-6 sm:p-10">
-      <div className="max-w-3xl mx-auto space-y-6">
-        <h1 className="text-2xl font-semibold">Video → Recipe</h1>
-        <div className="space-y-3">
-          <label className="block text-sm font-medium">Video URL</label>
-          <input
-            className="w-full border rounded px-3 py-2"
-            placeholder="https://..."
-            value={videoUrl}
-            onChange={(e) => setVideoUrl(e.target.value)}
-          />
-        </div>
-        <div className="space-y-3">
-          <label className="block text-sm font-medium">Or upload file</label>
-          <input type="file" accept=".mp4,.mov,.mkv,.webm" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-        </div>
-        <button
-          className="px-4 py-2 bg-black text-white rounded disabled:opacity-50"
-          disabled={!canSubmit}
-          onClick={handleSubmit}
-        >
-          Start
-        </button>
-
-        <div className="border rounded p-3">
-          <div className="text-sm">Job: {jobId ?? "—"}</div>
-          <div className="text-sm">State: {state}</div>
-          <div className="text-xs text-gray-500 break-words">Events: {events.join(", ")}</div>
-        </div>
-
-        {recipe && (
-          <div className="space-y-4">
-            <h2 className="text-xl font-semibold">Recipe</h2>
-            <div className="space-y-1">
-              <div className="font-medium">{recipe.title}</div>
-              <div className="text-sm">Servings: {recipe.servings}</div>
-              <div className="text-sm">Time: total {recipe.time.total}, active {recipe.time.active}</div>
+  // If we have a recipe, show the recipe display page
+  if (recipe) {
+    return (
+      <div 
+        className="min-h-screen"
+        style={{ backgroundColor: isDark ? 'var(--dark-bg)' : 'var(--light-bg)' }}
+      >
+        <Header isDark={isDark} onToggleTheme={toggleTheme} />
+        <div className="max-w-4xl mx-auto px-6 py-12">
+          <div style={{ color: isDark ? 'var(--dark-text)' : 'var(--light-text)' }}>
+            {/* Recipe Title and Metadata - Exact layout from design */}
+            <div className="flex flex-col md:flex-row md:justify-between md:items-start mb-8 space-y-4 md:space-y-0">
+              <h1 className="text-2xl md:text-3xl font-bold font-sans">{recipe.title}:</h1>
+              <div className="text-left md:text-right font-sans" style={{ color: isDark ? 'var(--dark-placeholder)' : 'var(--light-placeholder)' }}>
+                <p className="text-sm mb-1">Serves: {recipe.servings}</p>
+                <p className="text-sm">Total preparation time: {recipe.time.total}</p>
+              </div>
             </div>
-            <div>
-              <h3 className="font-medium">Ingredients</h3>
-              <ul className="list-disc pl-5 text-sm">
+
+            {/* Ingredients */}
+            <div className="mb-8">
+              <h2 className="text-xl font-bold mb-4 font-sans">Ingredients:</h2>
+              <ul className="space-y-2 font-sans">
                 {recipe.ingredients.map((ing, idx) => (
-                  <li key={idx}>
-                    {ing.quantity} {ing.unit} {ing.item} {ing.prep ? `(${ing.prep})` : ""}
+                  <li key={idx} className="flex items-start">
+                    <span className="mr-2">•</span>
+                    <span>
+                      {ing.quantity} {ing.unit} {ing.item} {ing.prep ? `(${ing.prep})` : ""}
+                    </span>
                   </li>
                 ))}
               </ul>
             </div>
-            <div>
-              <h3 className="font-medium">Equipment</h3>
-              <ul className="list-disc pl-5 text-sm">
-                {recipe.equipment.map((eq, idx) => (
-                  <li key={idx}>{eq}</li>
-                ))}
-              </ul>
-            </div>
-            <div>
-              <h3 className="font-medium">Instructions</h3>
-              <ol className="list-decimal pl-5 text-sm space-y-1">
+
+            {/* Instructions */}
+            <div className="mb-8">
+              <h2 className="text-xl font-bold mb-4 font-sans">Instructions:</h2>
+              <ol className="space-y-3 font-sans">
                 {recipe.steps.map((s) => (
-                  <li key={s.n}>
-                    {s.text} {s.time_hint ? `(${s.time_hint})` : ""}
+                  <li key={s.n} className="flex items-start">
+                    <span className="mr-3 font-bold">{s.n}.</span>
+                    <span>
+                      {s.text} {s.time_hint ? `(${s.time_hint})` : ""}
+                    </span>
                   </li>
                 ))}
               </ol>
             </div>
-            <div className="flex gap-2">
-              <button className="px-3 py-2 border rounded" onClick={() => download(JSON.stringify(recipe, null, 2), `${recipe.title}.json`, "application/json")}>
-                Download JSON
-              </button>
-              <button className="px-3 py-2 border rounded" onClick={() => download(markdown, `${recipe.title}.md`, "text/markdown")}>Download MD</button>
-              <button className="px-3 py-2 border rounded" onClick={() => download(txt, `${recipe.title}.txt`, "text/plain")}>Download TXT</button>
-            </div>
+
+            {/* Download Button - Exact styling from design */}
+            <button 
+              className="flex items-center space-x-2 px-6 py-3 rounded-lg font-medium transition-colors font-sans"
+              style={{
+                backgroundColor: isDark ? 'var(--dark-download-bg)' : 'var(--light-download-bg)',
+                color: isDark ? 'var(--dark-download-text)' : 'var(--light-download-text)'
+              }}
+              onClick={() => download(markdown, `${recipe.title}.md`, "text/markdown")}
+            >
+              <DownloadIcon className="w-5 h-5" />
+              <span>Download recipe</span>
+            </button>
           </div>
-        )}
+        </div>
+      </div>
+    );
+  }
+
+  // Main home page
+  return (
+    <div 
+      className="min-h-screen"
+      style={{ backgroundColor: isDark ? 'var(--dark-bg)' : 'var(--light-bg)' }}
+    >
+      <Header isDark={isDark} onToggleTheme={toggleTheme} />
+      
+      <div className="max-w-6xl mx-auto px-6 py-24">
+        {/* Hero Content - Left-aligned text block */}
+        <div className="max-w-2xl text-center md:text-left">
+          {/* Hero Title - Exact typography from Figma */}
+          <h1 
+            className="text-5xl hero-title mb-4 leading-tight font-sans"
+            style={{ color: isDark ? 'var(--dark-text)' : 'var(--light-text)' }}
+          >
+            <div>Watch Less,</div>
+            <div>Cook <span className="font-serif italic font-normal">More</span></div>
+          </h1>
+          
+          {/* Subtitle */}
+          <p 
+            className="text-xl mb-8 hero-subtitle font-sans"
+            style={{ color: isDark ? 'var(--dark-text)' : 'var(--light-text)' }}
+          >
+            Paste a link. Get the recipe. Eat sooner.
+          </p>
+
+          {/* Input Section */}
+          <div className="space-y-6">
+            {/* Video URL Input */}
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="Insert a valid video URL"
+                value={videoUrl}
+                onChange={(e) => setVideoUrl(e.target.value)}
+                className="w-full px-4 py-4 pr-12 rounded-lg text-lg font-normal focus:outline-none focus:ring-2 focus:ring-blue-500 font-sans"
+                style={{
+                  backgroundColor: isDark ? 'var(--dark-input-bg)' : 'var(--light-input-bg)',
+                  color: isDark ? 'var(--dark-text)' : 'var(--light-text)',
+                  border: `1px solid ${isDark ? 'var(--dark-border)' : 'var(--light-border)'}`
+                }}
+              />
+              <button
+                onClick={handleSubmit}
+                disabled={!canSubmit}
+                className="absolute right-3 top-1/2 transform -translate-y-1/2 p-2 transition-colors"
+                style={{
+                  color: canSubmit 
+                    ? (isDark ? 'var(--dark-text)' : 'var(--light-text)')
+                    : (isDark ? 'var(--dark-placeholder)' : 'var(--light-placeholder)')
+                }}
+              >
+                <PaperAirplaneIcon className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Divider with lines */}
+            <div className="flex items-center space-x-4">
+              <div 
+                className="flex-1 h-px"
+                style={{ backgroundColor: isDark ? 'var(--dark-border)' : 'var(--light-border)' }}
+              ></div>
+              <div 
+                className="text-sm font-normal font-sans px-2"
+                style={{ color: isDark ? 'var(--dark-text)' : 'var(--light-text)' }}
+              >
+                or
+              </div>
+              <div 
+                className="flex-1 h-px"
+                style={{ backgroundColor: isDark ? 'var(--dark-border)' : 'var(--light-border)' }}
+              ></div>
+            </div>
+
+            {/* File Upload Button */}
+            <div className="flex justify-center md:justify-start">
+              <div className="relative">
+                <input
+                  type="file"
+                  accept=".mp4,.mov,.mkv,.webm"
+                  onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                  id="file-upload"
+                />
+                <label
+                  htmlFor="file-upload"
+                  className="flex items-center justify-center space-x-2 px-4 py-2 rounded-full font-normal transition-colors cursor-pointer font-sans border"
+                  style={{
+                    backgroundColor: isDark ? 'var(--dark-input-bg)' : 'var(--light-input-bg)',
+                    color: isDark ? 'var(--dark-text)' : 'var(--light-text)',
+                    borderColor: isDark ? 'var(--dark-border)' : 'var(--light-border)'
+                  }}
+                >
+                  <PaperclipIcon className="w-4 h-4" />
+                  <span>Attach file</span>
+                </label>
+              </div>
+            </div>
+
+            {/* File name display */}
+            {file && (
+              <p 
+                className="text-sm font-sans"
+                style={{ color: isDark ? 'var(--dark-placeholder)' : 'var(--light-placeholder)' }}
+              >
+                Selected: {file.name}
+              </p>
+            )}
+
+            {/* Status Display */}
+            {state !== "idle" && (
+              <div 
+                className="p-4 rounded-lg font-sans"
+                style={{
+                  backgroundColor: isDark ? 'var(--dark-input-bg)' : 'var(--light-input-bg)',
+                  color: isDark ? 'var(--dark-text)' : 'var(--light-text)',
+                  border: `1px solid ${isDark ? 'var(--dark-border)' : 'var(--light-border)'}`
+                }}
+              >
+                <div className="text-sm">
+                  <div>Job: {jobId ?? "—"}</div>
+                  <div>State: {state}</div>
+                  {events.length > 0 && (
+                    <div className="text-xs opacity-75 break-words">
+                      Events: {events.join(", ")}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
